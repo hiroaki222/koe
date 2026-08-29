@@ -112,6 +112,10 @@ fn stitch(carry: &mut Vec<u8>, bytes: &[u8]) -> String {
 fn transcribe(audio: &[f32], model: &str, lang: &str) -> Vec<TextSegment> {
     use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
+    // whisper.cpp writes forty lines of device and model detail to stderr on load.
+    // The hook routes them to the `log` crate, which drops them without a logger.
+    whisper_rs::install_logging_hooks();
+
     let ctx = WhisperContext::new_with_params(model, WhisperContextParameters::default())
         .expect("failed to load whisper model");
     let mut state = ctx.create_state().expect("failed to create whisper state");

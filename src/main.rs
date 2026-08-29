@@ -89,22 +89,32 @@ fn decode(path: &str) -> Vec<f32> {
 /// two segments; decoding each one independently turns it into two replacement chars.
 fn stitch(carry: &mut Vec<u8>, bytes: &[u8]) -> String {
     carry.extend_from_slice(bytes);
-    match std::str::from_utf8(carry) {
-        Ok(s) => {
-            let out = s.to_string();
-            carry.clear();
-            out
-        }
-        Err(e) => {
-            let good = e.valid_up_to();
-            let out = std::str::from_utf8(&carry[..good]).unwrap().to_string();
-            match e.error_len() {
-                // Truncated tail: hold it back for the next segment.
-                None => carry.drain(..good),
-                // Genuinely invalid: drop the offending bytes rather than stall.
-                Some(n) => carry.drain(..good + n),
-            };
-            out
+    let mut out = String::new();
+    loop {
+        match std::str::from_utf8(carry) {
+            Ok(s) => {
+                out.push_str(s);
+                carry.clear();
+                return out;
+            }
+            Err(e) => {
+                let good = e.valid_up_to();
+                out.push_str(std::str::from_utf8(&carry[..good]).unwrap());
+                match e.error_len() {
+                    // Truncated tail: hold it back for the next segment.
+                    None => {
+                        carry.drain(..good);
+                        return out;
+                    }
+                    // Bytes that can never complete. Mark them and carry on through
+                    // the rest, which is otherwise stranded until the next segment
+                    // and lost outright if this was the last one.
+                    Some(n) => {
+                        out.push(char::REPLACEMENT_CHARACTER);
+                        carry.drain(..good + n);
+                    }
+                }
+            }
         }
     }
 }
@@ -151,6 +161,15 @@ fn transcribe(audio: &[f32], model: &str, lang: &str) -> Vec<TextSegment> {
             text,
             no_speech: seg.no_speech_probability(),
         });
+    }
+
+    // Anything still held back can never complete, so it is reported rather than
+    // dropped on the way out.
+    if !carry.is_empty() {
+        eprintln!(
+            "discarded {} trailing bytes that form no character",
+            carry.len()
+        );
     }
     out
 }
@@ -211,6 +230,13 @@ fn mmss(t: f64) -> String {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(arg) = std::env::args().nth(1) {
+        if arg == "--version" || arg == "-V" {
+            println!("koe {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+    }
+
     let Some(media) = std::env::args().nth(1) else {
         eprintln!("usage: koe <audio-or-video-file>");
         eprintln!();
@@ -397,4 +423,103 @@ fn write_minutes(
     let path = outdir.join("minutes.md");
     std::fs::write(&path, format!("{}\n", body.trim_end()))?;
     Ok(Some(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seg(t0: f64, t1: f64, text: &str) -> TextSegment {
+        TextSegment {
+            t0,
+            t1,
+            text: text.into(),
+            no_speech: 0.0,
+        }
+    }
+
+    #[test]
+    fn stitch_passes_through_complete_input() {
+        let mut carry = Vec::new();
+        assert_eq!(stitch(&mut carry, "おはよう".as_bytes()), "おはよう");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn stitch_rejoins_a_character_split_across_segments() {
+        let whole = "あい".as_bytes();
+        let (head, tail) = whole.split_at(4); // mid-way through the second character
+        let mut carry = Vec::new();
+
+        assert_eq!(stitch(&mut carry, head), "あ");
+        assert!(!carry.is_empty(), "the truncated tail must be held back");
+        assert_eq!(stitch(&mut carry, tail), "い");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn stitch_handles_a_segment_that_opens_with_a_continuation_byte() {
+        let whole = "日本語".as_bytes();
+        let mut carry = Vec::new();
+        let mut out = String::new();
+        // One byte at a time is the worst case: every boundary lands mid-character.
+        for b in whole {
+            out.push_str(&stitch(&mut carry, &[*b]));
+        }
+        assert_eq!(out, "日本語");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn stitch_drops_bytes_that_can_never_complete() {
+        let mut carry = Vec::new();
+        // 0xFF starts no valid sequence. It is marked, and the byte after it still
+        // comes through in the same call.
+        assert_eq!(stitch(&mut carry, &[0xFF, b'a']), "\u{FFFD}a");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn stitch_keeps_nul_which_is_valid_utf8() {
+        let mut carry = Vec::new();
+        assert_eq!(stitch(&mut carry, &[b'a', 0x00, b'b']), "a\0b");
+    }
+
+    #[test]
+    fn merge_attributes_each_segment_to_its_dominant_speaker() {
+        let texts = vec![seg(0.0, 2.0, "ひとつめ"), seg(3.0, 5.0, "ふたつめ")];
+        let diar = vec![
+            (0.0, 2.0, "SPEAKER_00".to_string()),
+            (3.0, 5.0, "SPEAKER_01".to_string()),
+        ];
+        let (turns, dropped) = merge(&texts, &diar);
+
+        assert_eq!(dropped, 0);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].speaker, "SPEAKER_00");
+        assert_eq!(turns[1].speaker, "SPEAKER_01");
+    }
+
+    #[test]
+    fn merge_collapses_a_run_of_one_speaker_into_a_single_turn() {
+        let texts = vec![seg(0.0, 1.0, "まず"), seg(1.0, 2.0, "つぎ")];
+        let diar = vec![(0.0, 2.0, "SPEAKER_00".to_string())];
+        let (turns, _) = merge(&texts, &diar);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].text, "まず つぎ");
+        assert_eq!(turns[0].t1, 2.0);
+    }
+
+    #[test]
+    fn merge_drops_text_that_overlaps_no_speech() {
+        // Whisper's hallucinated filler over a silence lands outside every speaker.
+        let texts = vec![seg(0.0, 5.0, "はい"), seg(10.0, 11.0, "本題")];
+        let diar = vec![(10.0, 11.0, "SPEAKER_00".to_string())];
+        let (turns, dropped) = merge(&texts, &diar);
+
+        assert_eq!(dropped, 1);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].text, "本題");
+    }
 }

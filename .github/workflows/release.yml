@@ -30,8 +30,8 @@ jobs:
           persist-credentials: false
 
       # A tag that disagrees with Cargo.toml ships a binary reporting the wrong
-      # version, and the formula would pin a tarball whose contents contradict
-      # its own version field.
+      # version, and the tap would pin a tarball whose contents contradict the
+      # version it advertises.
       - name: Check the tag against Cargo.toml
         if: github.ref_type == 'tag'
         run: |
@@ -131,45 +131,8 @@ jobs:
             "${{ steps.pack.outputs.asset }}" \
             "${{ steps.pack.outputs.asset }}.sha256" --clobber
 
-  # The formula pins a tarball by hash, and that hash only exists once the tag
-  # does. Updating it by hand is the step that gets forgotten, so the release
-  # that just shipped is what rewrites it.
-  formula:
-    needs: build
-    if: github.ref_type == 'tag'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: main
-
-      - name: Point the formula at this tag
-        run: |
-          set -euo pipefail
-          url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
-          sha="$(bash .github/scripts/fetch.sh "$url" source.tar.gz >/dev/null \
-                 && shasum -a 256 source.tar.gz | cut -d' ' -f1)"
-          rm -f source.tar.gz
-          sed -i -E "s|^  url \".*\"|  url \"${url}\"|" Formula/koe.rb
-          sed -i -E "s|^  sha256 \".*\"|  sha256 \"${sha}\"|" Formula/koe.rb
-          grep -E '^  (url|sha256)' Formula/koe.rb
-
-      - name: Commit it
-        run: |
-          set -euo pipefail
-          if git diff --quiet; then
-            echo "formula already current"
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -am "chore: point formula at $GITHUB_REF_NAME"
-          git push origin main
-
   publish:
-    needs: [build, formula]
+    needs: build
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:

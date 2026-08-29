@@ -19,8 +19,7 @@ Whisper の言語を `ja` に固定しています。自動判定は冒頭 30 �
 ## インストール
 
 ```sh
-brew tap hiroaki222/koe https://github.com/hiroaki222/koe
-brew install koe
+brew install hiroaki222/tap/koe
 ```
 
 自分でビルドするなら `cmake` が要ります。whisper.cpp をコンパイルするためです。

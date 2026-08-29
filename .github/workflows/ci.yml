@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # macOS only. The crate pulls in Metal through whisper-rs and CoreML through
+  # speakrs, so there is no other platform it compiles on, let alone runs.
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # whisper-rs builds whisper.cpp from source.
+      - run: brew install cmake
+
+      # The runner has ffmpeg only if we put it there, and koe shells out to
+      # both binaries rather than linking a decoder.
+      - run: brew install ffmpeg
+      - run: |
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features
+
+      # A release build is what the formula and the release archive produce, and
+      # it is the only configuration where whisper.cpp is compiled optimised.
+      - run: cargo build --release --locked

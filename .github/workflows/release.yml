@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Tag-only workflows cannot be exercised until the moment they matter. A
+  # manual run builds and packs without touching the release page: every step
+  # that publishes is guarded on the tag.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - run: brew install cmake
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Apple silicon only. Intel Macs cannot run the Metal and CoreML paths
+      # this tool depends on for its speed, so shipping for them would ship
+      # something slower than the tool claims to be.
+      - run: cargo build --release --locked --target aarch64-apple-darwin
+
+      - name: Pack it
+        id: pack
+        run: |
+          set -euo pipefail
+          name="koe-$GITHUB_REF_NAME-aarch64-apple-darwin"
+          tar -czf "$name.tar.gz" \
+            -C target/aarch64-apple-darwin/release koe \
+            -C "$GITHUB_WORKSPACE" LICENSE-MIT LICENSE-APACHE README.md
+          shasum -a 256 "$name.tar.gz" | tee "$name.tar.gz.sha256"
+          echo "asset=$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag || true
+          gh release upload "$GITHUB_REF_NAME" \
+            "${{ steps.pack.outputs.asset }}" \
+            "${{ steps.pack.outputs.asset }}.sha256" --clobber
+
+  # The formula pins a tarball by hash, and that hash only exists once the tag
+  # does. Updating it by hand is the step that gets forgotten, so the release
+  # that just shipped is the one that rewrites it.
+  formula:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Point the formula at this tag
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${tag}.tar.gz"
+
+          # GitHub generates the source tarball on demand; it exists as soon as
+          # the tag does, and its hash is stable for that tag.
+          sha="$(curl -fsSL "$url" | shasum -a 256 | cut -d' ' -f1)"
+
+          sed -i -E "s|^  url \".*\"|  url \"${url}\"|" Formula/koe.rb
+          sed -i -E "s|^  sha256 \".*\"|  sha256 \"${sha}\"|" Formula/koe.rb
+          grep -E '^  (url|sha256)' Formula/koe.rb
+
+      - name: Commit it
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "formula already current"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore: point formula at $GITHUB_REF_NAME"
+          git push origin main

@@ -3,9 +3,9 @@ name: Release
 on:
   push:
     tags: ["v*"]
-  # Tag-only workflows cannot be exercised until the moment they matter. A
-  # manual run builds and packs without touching the release page: every step
-  # that publishes is guarded on the tag.
+  # A tag-only workflow cannot be exercised until the moment it matters. A
+  # manual run builds, packs and assembles the notes without touching the
+  # release page: every step that publishes is guarded on the tag.
   workflow_dispatch:
 
 permissions:
@@ -15,7 +15,84 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The draft goes up first so the build has somewhere to upload to, and stays
+  # a draft until it has. A release page carrying notes but no downloads reads
+  # as broken for as long as the build takes.
+  draft:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # git-cliff reads the whole history to work out what this tag added.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # A tag that disagrees with Cargo.toml ships a binary reporting the wrong
+      # version, and the formula would pin a tarball whose contents contradict
+      # its own version field.
+      - name: Check the tag against Cargo.toml
+        if: github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
+          crate="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$crate" != "$tag" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $crate" >&2
+            exit 1
+          fi
+
+      - name: Fetch git-cliff
+        run: |
+          set -euo pipefail
+          version=2.13.1
+          name="git-cliff-$version-x86_64-unknown-linux-gnu"
+          bash .github/scripts/fetch.sh \
+            "https://github.com/orhun/git-cliff/releases/download/v$version/$name.tar.gz" \
+            cliff.tar.gz
+          tar -xzf cliff.tar.gz
+          find . -type f -name git-cliff -exec mv {} ./git-cliff \;
+          chmod +x ./git-cliff
+          ./git-cliff --version
+
+      # GitHub renders the assets below the body, so the setup notice goes last:
+      # nearest the download links, where someone about to install will read it.
+      - name: Assemble the release body
+        run: |
+          set -euo pipefail
+          ./git-cliff --latest --strip all > release-body.md
+
+          # An empty changelog means the tag matched no commits. That is a
+          # mistake worth stopping for rather than publishing around, and it
+          # has to be checked before the notice is appended or the notice
+          # alone would pass.
+          test -s release-body.md
+
+          printf '\n' >> release-body.md
+          cat .github/release-notice.md >> release-body.md
+          cat release-body.md
+
+      - name: Open a draft
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF_NAME" in
+            *-alpha*|*-beta*|*-rc*) pre=true ;;
+            *)                      pre=false ;;
+          esac
+          gh api "repos/$GITHUB_REPOSITORY/releases" \
+            -f "tag_name=$GITHUB_REF_NAME" \
+            -f "name=$GITHUB_REF_NAME" \
+            -F "body=@release-body.md" \
+            -F draft=true \
+            -F "prerelease=$pre" \
+            --jq .id
+
   build:
+    needs: draft
     runs-on: macos-latest
     permissions:
       contents: write
@@ -28,9 +105,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      # Apple silicon only. Intel Macs cannot run the Metal and CoreML paths
-      # this tool depends on for its speed, so shipping for them would ship
-      # something slower than the tool claims to be.
+      # Apple silicon only. An Intel Mac cannot run the Metal and CoreML paths
+      # this tool depends on, so a build for it would be slower than the tool
+      # claims to be.
       - run: cargo build --release --locked --target aarch64-apple-darwin
 
       - name: Pack it
@@ -50,14 +127,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag || true
           gh release upload "$GITHUB_REF_NAME" \
             "${{ steps.pack.outputs.asset }}" \
             "${{ steps.pack.outputs.asset }}.sha256" --clobber
 
   # The formula pins a tarball by hash, and that hash only exists once the tag
   # does. Updating it by hand is the step that gets forgotten, so the release
-  # that just shipped is the one that rewrites it.
+  # that just shipped is what rewrites it.
   formula:
     needs: build
     if: github.ref_type == 'tag'
@@ -72,13 +148,10 @@ jobs:
       - name: Point the formula at this tag
         run: |
           set -euo pipefail
-          tag="$GITHUB_REF_NAME"
-          url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${tag}.tar.gz"
-
-          # GitHub generates the source tarball on demand; it exists as soon as
-          # the tag does, and its hash is stable for that tag.
-          sha="$(curl -fsSL "$url" | shasum -a 256 | cut -d' ' -f1)"
-
+          url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
+          sha="$(bash .github/scripts/fetch.sh "$url" source.tar.gz >/dev/null \
+                 && shasum -a 256 source.tar.gz | cut -d' ' -f1)"
+          rm -f source.tar.gz
           sed -i -E "s|^  url \".*\"|  url \"${url}\"|" Formula/koe.rb
           sed -i -E "s|^  sha256 \".*\"|  sha256 \"${sha}\"|" Formula/koe.rb
           grep -E '^  (url|sha256)' Formula/koe.rb
@@ -94,3 +167,16 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -am "chore: point formula at $GITHUB_REF_NAME"
           git push origin main
+
+  publish:
+    needs: [build, formula]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Everything has uploaded by now, so there is something to show.
+      - name: Take it out of draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --repo "$GITHUB_REPOSITORY"

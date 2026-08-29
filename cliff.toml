@@ -1,0 +1,45 @@
+# Release notes come from the commit history, which is Conventional Commits
+# throughout. Nothing here reads pull request labels, so a tag pushed from a
+# local branch produces the same notes as one merged through a PR.
+
+[changelog]
+header = ""
+body = """
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim | upper_first }}
+{% for commit in commits %}
+- {{ commit.message | upper_first }}\
+{% if commit.breaking %} **(breaking)**{% endif %}\
+{% endfor %}
+{% endfor %}
+"""
+trim = true
+footer = ""
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+filter_commits = true
+topo_order = false
+sort_commits = "newest"
+
+# The numbers in the comments only exist to order the groups; the template
+# strips them. Without them group_by sorts alphabetically, which puts
+# documentation above features.
+#
+# First match wins, so the skips come first. A `fix(ci)` would otherwise reach
+# `^fix` before `^ci` and appear under Fixes, reading as though something the
+# user relies on had been broken.
+commit_parsers = [
+  { message = '^\w+\(ci\)', skip = true },
+  { message = "^chore", skip = true },
+  { message = "^ci", skip = true },
+  { message = "^feat", group = "<!-- 0 -->Features" },
+  { message = "^fix", group = "<!-- 1 -->Fixes" },
+  { message = "^perf", group = "<!-- 2 -->Performance" },
+  # Not skipped: this changes what the download contains.
+  { message = "^build", group = "<!-- 3 -->Packaging" },
+  { message = "^docs", group = "<!-- 4 -->Documentation" },
+  { message = "^refactor", group = "<!-- 5 -->Refactoring" },
+  { message = "^test", group = "<!-- 6 -->Tests" },
+]

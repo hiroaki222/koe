@@ -1,0 +1,17 @@
+[package]
+name = "koe"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hiroaki222/koe"
+description = "Speaker-attributed transcripts and minutes for Japanese meetings, entirely on your machine"
+
+[profile.release]
+lto = "thin"
+
+[dependencies]
+# `default-linalg` must stay on: speakrs's `default` is ["online", "default-linalg"],
+# so dropping defaults to disable the runtime model download also drops the BLAS backend.
+speakrs = { version = "0.5", default-features = false, features = ["coreml", "default-linalg", "online"] }
+whisper-rs = { version = "0.16", features = ["metal"] }

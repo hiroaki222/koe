@@ -4,6 +4,8 @@ use std::process::{Command, Stdio};
 
 const SAMPLE_RATE: u32 = 16_000;
 
+const DEFAULT_MINUTES_PROMPT: &str = include_str!("../prompts/minutes.ja.txt");
+
 #[derive(Debug, Clone)]
 struct TextSegment {
     t0: f64,
@@ -208,10 +210,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let Some(media) = std::env::args().nth(1) else {
         eprintln!("usage: koe <audio-or-video-file>");
         eprintln!();
-        eprintln!("Writes <input dir>/<input name>/transcript.txt.");
+        eprintln!("Writes <input dir>/<input name>/transcript.txt, and minutes.md when");
+        eprintln!("KOE_LLM_MODEL points at a GGUF.");
         eprintln!();
         eprintln!("  KOE_WHISPER_MODEL   path to a whisper ggml model (required)");
+        eprintln!("  KOE_LLM_MODEL       path to a GGUF for minutes (optional)");
         eprintln!("  KOE_LANG            whisper language, default ja");
+        eprintln!("  KOE_MINUTES_PROMPT  override the built-in minutes prompt");
         std::process::exit(2);
     };
     let model = std::env::var("KOE_WHISPER_MODEL")
@@ -321,5 +326,71 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     std::fs::write(&transcript_path, &out)?;
     eprintln!("wrote {}", transcript_path.display());
 
+    match write_minutes(&outdir, &out) {
+        Ok(Some(path)) => eprintln!("wrote {}", path.display()),
+        Ok(None) => eprintln!("skipped minutes: set KOE_LLM_MODEL to a GGUF to generate them"),
+        Err(e) => eprintln!("minutes failed: {e}"),
+    }
     Ok(())
+}
+
+/// Run the minutes prompt through llama.cpp. Absent a model this is skipped rather than
+/// failing: the transcript is the expensive artifact and must not be lost to it.
+fn write_minutes(
+    outdir: &std::path::Path,
+    transcript: &str,
+) -> Result<Option<std::path::PathBuf>, Box<dyn std::error::Error + Send + Sync>> {
+    let Ok(model) = std::env::var("KOE_LLM_MODEL") else {
+        return Ok(None);
+    };
+    // Embedded so koe runs from any directory; override to experiment with wording.
+    let head = match std::env::var("KOE_MINUTES_PROMPT") {
+        Ok(path) => std::fs::read_to_string(&path)
+            .map_err(|e| format!("minutes prompt not readable: {path}: {e}"))?,
+        Err(_) => DEFAULT_MINUTES_PROMPT.to_string(),
+    };
+
+    let combined = outdir.join(".minutes-prompt.txt");
+    std::fs::write(&combined, format!("{head}{transcript}"))?;
+
+    let out = Command::new("llama-cli")
+        .args([
+            "-m",
+            &model,
+            "-f",
+            &combined.to_string_lossy(),
+            "-c",
+            "32768",
+            "-n",
+            "3000",
+            "--temp",
+            "0.2",
+            "-st",
+            "--no-warmup",
+            "-rea",
+            "off",
+        ])
+        .stderr(Stdio::null())
+        .output()?;
+    let _ = std::fs::remove_file(&combined);
+    if !out.status.success() {
+        return Err(format!("llama-cli exited with {}", out.status).into());
+    }
+
+    // llama-cli prints a banner, the echoed prompt, then the answer; keep the answer.
+    let text = String::from_utf8_lossy(&out.stdout);
+    let body = match text.find("■ 日時") {
+        Some(i) => {
+            let tail = &text[i..];
+            match tail.rfind("[ Prompt:") {
+                Some(j) => &tail[..j],
+                None => tail,
+            }
+        }
+        None => return Err("llama-cli produced no minutes".into()),
+    };
+
+    let path = outdir.join("minutes.md");
+    std::fs::write(&path, format!("{}\n", body.trim_end()))?;
+    Ok(Some(path))
 }

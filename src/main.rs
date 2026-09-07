@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 const SAMPLE_RATE: u32 = 16_000;
 
@@ -119,6 +120,50 @@ fn stitch(carry: &mut Vec<u8>, bytes: &[u8]) -> String {
     }
 }
 
+const PROGRESS_WIDTH: usize = 32;
+
+/// A percentage bar redrawn in place on stderr. Inert when stderr is not a terminal, so
+/// the carriage returns never reach a pipe or a log file.
+struct Progress {
+    label: &'static str,
+    enabled: bool,
+    shown: i32,
+}
+
+impl Progress {
+    fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            enabled: std::io::stderr().is_terminal(),
+            shown: -1,
+        }
+    }
+
+    fn set(&mut self, percent: i32) {
+        let percent = percent.clamp(0, 100);
+        if !self.enabled || percent == self.shown {
+            return;
+        }
+        self.shown = percent;
+        let filled = PROGRESS_WIDTH * percent as usize / 100;
+        eprint!(
+            "\r{} [{}{}] {percent:>3}%",
+            self.label,
+            "\u{2588}".repeat(filled),
+            "\u{00b7}".repeat(PROGRESS_WIDTH - filled),
+        );
+        let _ = std::io::stderr().flush();
+    }
+
+    /// Clears the line so the summary that follows takes its place.
+    fn finish(&mut self) {
+        if self.enabled {
+            eprint!("\r\u{1b}[2K");
+            let _ = std::io::stderr().flush();
+        }
+    }
+}
+
 fn transcribe(audio: &[f32], model: &str, lang: &str) -> Vec<TextSegment> {
     use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
@@ -136,13 +181,37 @@ fn transcribe(audio: &[f32], model: &str, lang: &str) -> Vec<TextSegment> {
     // or unrelated nouns, so it does not steer the lexicon at all.
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
     params.set_language(Some(lang));
+
+    // Whisper feeds each window's decoded tokens into the next window's prompt, so a
+    // repetition loop sustains itself instead of decaying: on a 157-minute recording one
+    // loop that began at 09:50 ran to the end, filling 93% of the transcript with a single
+    // fabricated sentence. `no_context` does not help here -- it clears the carry-over only
+    // between whisper_full calls, and this is one call per file. Zeroing n_max_text_ctx is
+    // what actually skips the carry-over, at the cost of proper-noun consistency across
+    // windows.
+    params.set_n_max_text_ctx(0);
     params.set_print_special(false);
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
     params.set_n_threads(num_threads());
 
-    state.full(params, audio).expect("whisper failed");
+    // The bar is cosmetic, so a poisoned lock skips a frame rather than taking the
+    // transcription down with it. Clearing the line happens before the result is
+    // unwrapped, so a whisper failure reports onto a clean line instead of onto the bar.
+    let progress = Arc::new(Mutex::new(Progress::new("transcribing")));
+    let sink = Arc::clone(&progress);
+    params.set_progress_callback_safe(move |percent| {
+        if let Ok(mut bar) = sink.lock() {
+            bar.set(percent);
+        }
+    });
+
+    let outcome = state.full(params, audio);
+    if let Ok(mut bar) = progress.lock() {
+        bar.finish();
+    }
+    outcome.expect("whisper failed");
 
     let mut carry = Vec::new();
     let mut out = Vec::new();

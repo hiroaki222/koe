@@ -196,12 +196,22 @@ fn transcribe(audio: &[f32], model: &str, lang: &str) -> Vec<TextSegment> {
     params.set_print_timestamps(false);
     params.set_n_threads(num_threads());
 
+    // The bar is cosmetic, so a poisoned lock skips a frame rather than taking the
+    // transcription down with it. Clearing the line happens before the result is
+    // unwrapped, so a whisper failure reports onto a clean line instead of onto the bar.
     let progress = Arc::new(Mutex::new(Progress::new("transcribing")));
     let sink = Arc::clone(&progress);
-    params.set_progress_callback_safe(move |percent| sink.lock().unwrap().set(percent));
+    params.set_progress_callback_safe(move |percent| {
+        if let Ok(mut bar) = sink.lock() {
+            bar.set(percent);
+        }
+    });
 
-    state.full(params, audio).expect("whisper failed");
-    progress.lock().unwrap().finish();
+    let outcome = state.full(params, audio);
+    if let Ok(mut bar) = progress.lock() {
+        bar.finish();
+    }
+    outcome.expect("whisper failed");
 
     let mut carry = Vec::new();
     let mut out = Vec::new();

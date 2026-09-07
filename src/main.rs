@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 const SAMPLE_RATE: u32 = 16_000;
 
@@ -119,6 +120,50 @@ fn stitch(carry: &mut Vec<u8>, bytes: &[u8]) -> String {
     }
 }
 
+const PROGRESS_WIDTH: usize = 32;
+
+/// A percentage bar redrawn in place on stderr. Inert when stderr is not a terminal, so
+/// the carriage returns never reach a pipe or a log file.
+struct Progress {
+    label: &'static str,
+    enabled: bool,
+    shown: i32,
+}
+
+impl Progress {
+    fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            enabled: std::io::stderr().is_terminal(),
+            shown: -1,
+        }
+    }
+
+    fn set(&mut self, percent: i32) {
+        let percent = percent.clamp(0, 100);
+        if !self.enabled || percent == self.shown {
+            return;
+        }
+        self.shown = percent;
+        let filled = PROGRESS_WIDTH * percent as usize / 100;
+        eprint!(
+            "\r{} [{}{}] {percent:>3}%",
+            self.label,
+            "\u{2588}".repeat(filled),
+            "\u{00b7}".repeat(PROGRESS_WIDTH - filled),
+        );
+        let _ = std::io::stderr().flush();
+    }
+
+    /// Clears the line so the summary that follows takes its place.
+    fn finish(&mut self) {
+        if self.enabled {
+            eprint!("\r\u{1b}[2K");
+            let _ = std::io::stderr().flush();
+        }
+    }
+}
+
 fn transcribe(audio: &[f32], model: &str, lang: &str) -> Vec<TextSegment> {
     use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
@@ -151,7 +196,12 @@ fn transcribe(audio: &[f32], model: &str, lang: &str) -> Vec<TextSegment> {
     params.set_print_timestamps(false);
     params.set_n_threads(num_threads());
 
+    let progress = Arc::new(Mutex::new(Progress::new("transcribing")));
+    let sink = Arc::clone(&progress);
+    params.set_progress_callback_safe(move |percent| sink.lock().unwrap().set(percent));
+
     state.full(params, audio).expect("whisper failed");
+    progress.lock().unwrap().finish();
 
     let mut carry = Vec::new();
     let mut out = Vec::new();

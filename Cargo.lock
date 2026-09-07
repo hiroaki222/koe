@@ -1162,7 +1162,7 @@ checksum = "f868feceed4703c842925c14232667c5f29c8059d0354154b2d06ec3bf9daf82"
 
 [[package]]
 name = "koe"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "speakrs",
  "whisper-rs",

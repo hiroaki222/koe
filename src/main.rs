@@ -136,6 +136,15 @@ fn transcribe(audio: &[f32], model: &str, lang: &str) -> Vec<TextSegment> {
     // or unrelated nouns, so it does not steer the lexicon at all.
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
     params.set_language(Some(lang));
+
+    // Whisper feeds each window's decoded tokens into the next window's prompt, so a
+    // repetition loop sustains itself instead of decaying: on a 157-minute recording one
+    // loop that began at 09:50 ran to the end, filling 93% of the transcript with a single
+    // fabricated sentence. `no_context` does not help here -- it clears the carry-over only
+    // between whisper_full calls, and this is one call per file. Zeroing n_max_text_ctx is
+    // what actually skips the carry-over, at the cost of proper-noun consistency across
+    // windows.
+    params.set_n_max_text_ctx(0);
     params.set_print_special(false);
     params.set_print_progress(false);
     params.set_print_realtime(false);
